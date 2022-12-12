@@ -6,6 +6,7 @@ from torch import nn
 import seaborn as sns
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.sparse.linalg.eigen.arpack import eigsh as largest_eigsh
 
 from data.generative_model import NonlinearFactorModelSingleIndex, GenerativeModelDataset
 from estimators.regression_nn import RegressionNNEstimator
@@ -19,16 +20,17 @@ import time
 init(autoreset=True)
 parser = argparse.ArgumentParser()
 parser.add_argument("--n", help="number of samples", type=int, default=1000)
-parser.add_argument("--p", help="data dimension", type=int, default=1000)
-parser.add_argument("--r", help="factor dimension", type=int, default=1)
-parser.add_argument('--rz', help='estimated factor dimension', type=int, default=1)
-parser.add_argument("--batch_size", help="batch size", type=int, default=64)
+parser.add_argument("--p", help="data dimension", type=int, default=500)
+parser.add_argument("--r", help="factor dimension", type=int, default=2)
+parser.add_argument('--rz', help='estimated factor dimension', type=int, default=3)
+parser.add_argument('--rdpm', help='estimated factor dimension for dpm', type=int, default=4)
+parser.add_argument("--batch_size", help="batch size", type=int, default=128)
 
 parser.add_argument("--seed", help="random seed", type=int, default=0)
 args = parser.parse_args()
 
-encoder_hiddens = []
-decoder_hiddens = []
+encoder_hiddens = [100]
+decoder_hiddens = [100]
 
 start_time = time.time()
 np.random.seed(args.seed)
@@ -48,7 +50,11 @@ def ident(x):
 	return x
 
 
-nonlinear_factor_model = NonlinearFactorModelSingleIndex(p, r, index_func=np.sin)
+def nonlinear_index_func(x):
+	return 2 * (x ** 2) + np.sin(10 * x) + 1 / (1 + np.exp(-5 * x)) + x ** 4
+
+
+nonlinear_factor_model = NonlinearFactorModelSingleIndex(p, r, index_func=nonlinear_index_func, sigma=1.0)
 
 
 def nonlinear_factor_data(n):
@@ -74,9 +80,9 @@ test_dataloader = DataLoader(test_data, batch_size=batch_size, shuffle=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 ae_model = AutoEncoder(dim_x=p, dim_z=R, encoder_hidden=encoder_hiddens,
-						decoder_hidden=decoder_hiddens, latent_act='relu').to(device)
+						decoder_hidden=decoder_hiddens, latent_act=None).to(device)
 print(f'Autoencoder Model:\n {ae_model}')
-learning_rate = 1e-3
+learning_rate = 3e-3
 num_epoch = 300
 
 
@@ -107,14 +113,31 @@ ae_optimizer = torch.optim.Adam(ae_model.parameters(), lr=learning_rate)
 ae_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=ae_optimizer, gamma=0.995)
 mse_loss = nn.MSELoss()
 
+print(f'total sum of squares = {np.std(y_test_reg)**2}')
 # orcale regression error
 nn_est_oracle = RegressionNNEstimator(dim_x=r, depth=3, width=100)
 y_oracle = nn_est_oracle.fit_and_predict(f_train_reg, y_train_reg, f_valid_reg, y_valid_reg, f_test_reg)
 mse_oracle = np.mean(np.square(y_oracle - y_test_reg))
 print(f'oracle regression task error = {mse_oracle}')
 
+nn_est_x = RegressionNNEstimator(dim_x=p, depth=3, width=100)
+y_x = nn_est_x.fit_and_predict(x_train_reg, y_train_reg, x_valid_reg, y_valid_reg, x_test_reg)
+mse_x = np.mean(np.square(y_x - y_test_reg))
+print(f'vanilla nn regression task error = {mse_x}')
+
+cov_mat = np.matmul(np.transpose(x_train), x_train)
+eigen_values, eigen_vectors = largest_eigsh(cov_mat, args.rdpm, which='LM')
+dp_matrix = eigen_vectors / np.sqrt(p)
+nn_est_dpm = RegressionNNEstimator(dim_x=args.rdpm, depth=3, width=100)
+dpm_f_train = np.matmul(x_train_reg, dp_matrix)
+dpm_f_valid = np.matmul(x_valid_reg, dp_matrix)
+dpm_f_test = np.matmul(x_test_reg, dp_matrix)
+y_dpm = nn_est_dpm.fit_and_predict(dpm_f_train, y_train_reg, dpm_f_valid, y_valid_reg, dpm_f_test)
+mse_dpm = np.mean(np.square(y_dpm - y_test_reg))
+print(f'dpm nn regression task error = {mse_dpm}')
+
 for epoch in range(num_epoch):
-	if epoch % 10 == 0:
+	if epoch % 20 == 0:
 		test_losses = test_loop(test_dataloader, ae_model, mse_loss)
 		print(f"[Test]   " + unpack_loss(test_losses))
 		# test via regression task
@@ -129,3 +152,5 @@ for epoch in range(num_epoch):
 		print(f'regression task error = {mse}')
 	train_losses = train_loop(train_dataloader, ae_model, mse_loss, ae_optimizer)
 	print(f"[Train]    " + unpack_loss(train_losses))
+
+
